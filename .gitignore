@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment variables
+.env
+**/.env
+
+# ADK artifacts and session data
+.adk/
+**/.adk/
+
+# IDE
+.vscode/
+.idea/
