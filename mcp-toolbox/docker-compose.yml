@@ -1,0 +1,13 @@
+services:
+  toolbox:
+    image: us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:1.0.0
+    container_name: adk_toolbox
+    # host network — shares host's network stack to reach localhost:5433 (postgres) directly
+    network_mode: host
+    volumes:
+      - ./tools.yaml:/app/tools.yaml:ro
+    env_file: .env
+    # port 5002 — avoids conflict with reference mcp_toolbox on 5001 and MLflow on 5000
+    # --ui enables the Toolbox UI at http://localhost:5002/ui
+    command: ["--config", "/app/tools.yaml", "--port", "5002", "--ui"]
+    restart: unless-stopped
