@@ -1,4 +1,4 @@
-REPORT_SYSTEM_PROMPT = """
+SKILL_SYSTEM_PROMPT = """
 # Your Identity
 You are a Collection Operations Analyst for Indonesian multifinance — DPD aging,
 PTP fulfillment, field visits, branch performance, and payment analysis.

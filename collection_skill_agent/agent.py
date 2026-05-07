@@ -8,7 +8,7 @@ from google.adk.tools.skill_toolset import SkillToolset
 from google.adk.tools.toolbox_toolset import ToolboxToolset
 from google.genai import types as genai_types
 
-from .prompts import REPORT_SYSTEM_PROMPT
+from .prompts import SKILL_SYSTEM_PROMPT
 
 _SKILLS_DIR = pathlib.Path(__file__).parent / "skills"
 
@@ -28,12 +28,12 @@ skill_toolset = SkillToolset(
 
 root_agent = Agent(
     model="gemini-3.1-flash-lite-preview",
-    name="collection_report_agent",
+    name="collection_skill_agent",
     description=(
         "Collection operations analyst with skill-guided discovery. "
         "Uses SkillToolset for domain instructions and ToolboxToolset for execution."
     ),
-    instruction=REPORT_SYSTEM_PROMPT,
+    instruction=SKILL_SYSTEM_PROMPT,
     tools=[skill_toolset],
     planner=BuiltInPlanner(
         thinking_config=genai_types.ThinkingConfig(

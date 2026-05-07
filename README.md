@@ -45,7 +45,7 @@ Confirms SQL and parameters work before debugging through the agent layer.
 
 ### Milestone 5 — ADK SkillToolset + Second Agent (Tool-Based Execution)
 
-Created `collection_report_agent/` — a second ADK agent that uses `SkillToolset` with
+Created `collection_skill_agent/` — a second ADK agent that uses `SkillToolset` with
 3-level progressive disclosure alongside `ToolboxToolset` for SQL execution.
 
 **How it works:**
@@ -133,7 +133,7 @@ different trade-offs:
 
 | | Pattern 1 — Direct | Pattern 2 — Skills + Tools | Pattern 3 — Skills + Scripts |
 |---|---|---|---|
-| **Agent** | `collection_analysis_agent` | `collection_report_agent` | `collection_script_agent` |
+| **Agent** | `collection_analysis_agent` | `collection_skill_agent` | `collection_script_agent` |
 | **SkillToolset** | Not used | `additional_tools=[toolbox]` | `code_executor=UnsafeLocalCodeExecutor()` |
 | **Execution** | LLM → tool call → HTTP | LLM → `load_skill` → tool call → HTTP | LLM → `run_skill_script` → Python → HTTP |
 | **Skill scoping** | N/A | `adk_additional_tools` in frontmatter | SKILL.md workflow references scripts by name |
@@ -338,7 +338,7 @@ adk-sql-agent/
 │   ├── prompts.py                  # 5-pattern system prompt (behavior only)
 │   ├── __init__.py
 │   └── .env                        # GOOGLE_API_KEY + TOOLBOX_URL
-├── collection_report_agent/        # Pattern 2: SkillToolset + additional_tools
+├── collection_skill_agent/         # Pattern 2: SkillToolset + additional_tools
 │   ├── agent.py                    # SkillToolset(additional_tools=[toolbox])
 │   ├── prompts.py                  # minimal 3-section prompt
 │   ├── skills/
