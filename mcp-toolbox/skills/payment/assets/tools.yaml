@@ -1,0 +1,426 @@
+---
+# ── Source ────────────────────────────────────────────────────────────────────
+kind: source
+name: collection-db
+type: postgres
+host: ${COLLECTION_DB_HOST}
+port: ${COLLECTION_DB_PORT}
+database: ${COLLECTION_DB_NAME}
+user: ${COLLECTION_DB_USER}
+password: ${COLLECTION_DB_PASSWORD}
+
+---
+# ── Collection Report tools (executive summary) ───────────────────────────────
+
+kind: tool
+name: tool_visit_kpis
+type: postgres-sql
+source: collection-db
+description: >
+  Visit KPIs for a reporting period: total visits, unique contracts,
+  active collectors, paid count, PTP count, field-collected IDR,
+  and overall conversion rate.
+parameters:
+  - name: report_start
+    type: string
+    description: "Start date inclusive, format YYYY-MM-DD (e.g. '2025-01-01')"
+  - name: report_end
+    type: string
+    description: "End date inclusive, format YYYY-MM-DD (e.g. '2025-01-31')"
+statement: |
+  SELECT
+      COUNT(*)                                                   AS total_visits,
+      COUNT(DISTINCT f.contract_no)                              AS unique_contracts,
+      COUNT(DISTINCT f.collector_id)                             AS active_collectors,
+      COUNT(*) FILTER (WHERE f.visit_result = 'PAID')            AS paid_count,
+      COUNT(*) FILTER (WHERE f.visit_result = 'PTP')             AS ptp_count,
+      COALESCE(SUM(f.payment_amount), 0)                         AS field_collected_idr,
+      ROUND(
+          COUNT(*) FILTER (WHERE f.visit_result = 'PAID')::NUMERIC
+          / NULLIF(COUNT(*), 0) * 100, 2
+      )                                                          AS overall_conversion_pct
+  FROM juris_fact_collection_field_visit_activity_today_odps f
+  WHERE f.activity_date BETWEEN $1 AND $2;
+
+---
+kind: tool
+name: tool_dpd_aging
+type: postgres-sql
+source: collection-db
+description: >
+  DPD aging snapshot: unique contracts, average DPD, total outstanding IDR,
+  and total overdue IDR — grouped by collection_segment and dpd_bucket,
+  ordered by severity (EARLY → NPL → WO, shortest to longest bucket).
+parameters:
+  - name: report_start
+    type: string
+    description: "Start date inclusive, format YYYY-MM-DD"
+  - name: report_end
+    type: string
+    description: "End date inclusive, format YYYY-MM-DD"
+statement: |
+  SELECT
+      f.collection_segment,
+      f.dpd_bucket,
+      COUNT(DISTINCT f.contract_no)          AS unique_contracts,
+      ROUND(AVG(f.dpd), 0)                   AS avg_dpd,
+      SUM(f.outstanding_amount)              AS total_outstanding_idr,
+      SUM(f.overdue_amount)                  AS total_overdue_idr
+  FROM juris_fact_collection_field_visit_activity_today_odps f
+  WHERE f.activity_date BETWEEN $1 AND $2
+  GROUP BY f.collection_segment, f.dpd_bucket
+  ORDER BY
+      CASE f.collection_segment
+          WHEN 'EARLY' THEN 1 WHEN 'NPL' THEN 2 WHEN 'WO' THEN 3
+      END,
+      CASE f.dpd_bucket
+          WHEN 'Current' THEN 0 WHEN '1-30' THEN 1 WHEN '31-60' THEN 2
+          WHEN '61-90'   THEN 3 WHEN '91-120' THEN 4 WHEN '121-150' THEN 5
+          WHEN '151-180' THEN 6 ELSE 7
+      END;
+
+---
+kind: tool
+name: tool_branch_performance
+type: postgres-sql
+source: collection-db
+description: >
+  Branch performance table: visits, unique contracts, paid/PTP counts,
+  collected IDR, and conversion rate — sorted best to worst.
+parameters:
+  - name: report_start
+    type: string
+    description: "Start date inclusive, format YYYY-MM-DD"
+  - name: report_end
+    type: string
+    description: "End date inclusive, format YYYY-MM-DD"
+statement: |
+  SELECT
+      s.branch_name,
+      COUNT(*)                                                   AS total_visits,
+      COUNT(DISTINCT f.contract_no)                              AS contracts_visited,
+      COUNT(*) FILTER (WHERE f.visit_result = 'PAID')            AS paid_count,
+      COUNT(*) FILTER (WHERE f.visit_result = 'PTP')             AS ptp_count,
+      COALESCE(SUM(f.payment_amount), 0)                         AS collected_idr,
+      ROUND(
+          COUNT(*) FILTER (WHERE f.visit_result = 'PAID')::NUMERIC
+          / NULLIF(COUNT(*), 0) * 100, 2
+      )                                                          AS conversion_rate_pct
+  FROM juris_fact_collection_field_visit_activity_today_odps f
+  JOIN juris_dim_subcg_odps s ON s.subcg_code = f.subcg_code
+  WHERE f.activity_date BETWEEN $1 AND $2
+  GROUP BY s.branch_name
+  ORDER BY conversion_rate_pct DESC;
+
+---
+kind: tool
+name: tool_ptp_fulfillment
+type: postgres-sql
+source: collection-db
+description: >
+  PTP fulfillment analysis: total PTPs made, fulfilled/broken/pending counts,
+  fulfillment rate %, total promised IDR, fulfilled IDR, and broken exposure IDR.
+  A PTP is fulfilled if payment is received within 7 days of the promise date.
+parameters:
+  - name: report_start
+    type: string
+    description: "Start date inclusive, format YYYY-MM-DD"
+  - name: report_end
+    type: string
+    description: "End date inclusive, format YYYY-MM-DD"
+statement: |
+  SELECT
+      COUNT(*)                                                              AS total_ptp,
+      COUNT(p.id)                                                           AS fulfilled_count,
+      COUNT(*) FILTER (WHERE p.id IS NULL AND v.ptp_date < CURRENT_DATE)   AS broken_count,
+      COUNT(*) FILTER (WHERE p.id IS NULL AND v.ptp_date >= CURRENT_DATE)  AS pending_count,
+      ROUND(COUNT(p.id)::NUMERIC / NULLIF(COUNT(*), 0) * 100, 1)           AS fulfillment_rate_pct,
+      COALESCE(SUM(v.ptp_amount), 0)                                        AS total_promised_idr,
+      COALESCE(SUM(p.payment_amount), 0)                                    AS total_fulfilled_idr,
+      COALESCE(SUM(v.ptp_amount) FILTER (
+          WHERE p.id IS NULL AND v.ptp_date < CURRENT_DATE
+      ), 0)                                                                 AS broken_exposure_idr
+  FROM juris_fact_collection_field_visit_activity_today_odps v
+  LEFT JOIN juris_fact_payment_history_odps p
+      ON  p.contract_no   = v.contract_no
+      AND p.payment_date  BETWEEN v.ptp_date AND (v.ptp_date + 7)
+      AND p.payment_amount > 0
+  WHERE v.visit_result = 'PTP'
+    AND v.ptp_date IS NOT NULL
+    AND v.activity_date BETWEEN $1 AND $2;
+
+---
+# ── Visit Activity tools ──────────────────────────────────────────────────────
+
+kind: tool
+name: tool_visit_outcome_breakdown
+type: postgres-sql
+source: collection-db
+description: >
+  Distribution of all visit outcomes for a period: count and percentage share
+  for each visit_result (PAID, PTP, NOT_HOME, REFUSE, MOVED, UNIT_FOUND,
+  UNIT_NOT_FOUND). Use to understand visit effectiveness patterns.
+parameters:
+  - name: report_start
+    type: string
+    description: "Start date inclusive, format YYYY-MM-DD"
+  - name: report_end
+    type: string
+    description: "End date inclusive, format YYYY-MM-DD"
+statement: |
+  SELECT
+      f.visit_result,
+      COUNT(*)                                                     AS visit_count,
+      ROUND(COUNT(*)::NUMERIC / NULLIF(SUM(COUNT(*)) OVER (), 0) * 100, 1) AS pct_of_total
+  FROM juris_fact_collection_field_visit_activity_today_odps f
+  WHERE f.activity_date BETWEEN $1 AND $2
+  GROUP BY f.visit_result
+  ORDER BY visit_count DESC;
+
+---
+kind: tool
+name: tool_visit_collector_ranking
+type: postgres-sql
+source: collection-db
+description: >
+  Collector ranking by conversion rate: collector ID, name, branch, position,
+  total visits, paid/PTP counts, collected IDR, and conversion rate.
+  top_n controls how many rows to return (default: 10).
+parameters:
+  - name: report_start
+    type: string
+    description: "Start date inclusive, format YYYY-MM-DD"
+  - name: report_end
+    type: string
+    description: "End date inclusive, format YYYY-MM-DD"
+  - name: top_n
+    type: string
+    description: "Number of top collectors to return (default: 10, max: 50)"
+statement: |
+  SELECT
+      u.collector_id,
+      u.collector_name,
+      s.branch_name,
+      u.position,
+      COUNT(*)                                                   AS total_visits,
+      COUNT(*) FILTER (WHERE f.visit_result = 'PAID')            AS paid_count,
+      COUNT(*) FILTER (WHERE f.visit_result = 'PTP')             AS ptp_count,
+      COALESCE(SUM(f.payment_amount), 0)                         AS collected_idr,
+      ROUND(
+          COUNT(*) FILTER (WHERE f.visit_result = 'PAID')::NUMERIC
+          / NULLIF(COUNT(*), 0) * 100, 2
+      )                                                          AS conversion_rate_pct
+  FROM juris_fact_collection_field_visit_activity_today_odps f
+  JOIN juris_dim_user_odps  u ON u.collector_id = f.collector_id
+  JOIN juris_dim_subcg_odps s ON s.subcg_code   = f.subcg_code
+  WHERE f.activity_date BETWEEN $1 AND $2
+  GROUP BY u.collector_id, u.collector_name, s.branch_name, u.position
+  ORDER BY conversion_rate_pct DESC
+  LIMIT ($3::integer);
+
+---
+kind: tool
+name: tool_visit_daily_trend
+type: postgres-sql
+source: collection-db
+description: >
+  Day-by-day visit count and conversion rate trend for a period.
+  Useful for spotting high-activity days, salary-cycle spikes, or drops in
+  field effort. Returns one row per day ordered chronologically.
+parameters:
+  - name: report_start
+    type: string
+    description: "Start date inclusive, format YYYY-MM-DD"
+  - name: report_end
+    type: string
+    description: "End date inclusive, format YYYY-MM-DD"
+statement: |
+  SELECT
+      f.activity_date,
+      COUNT(*)                                                   AS total_visits,
+      COUNT(*) FILTER (WHERE f.visit_result = 'PAID')            AS paid_count,
+      COUNT(*) FILTER (WHERE f.visit_result = 'PTP')             AS ptp_count,
+      ROUND(
+          COUNT(*) FILTER (WHERE f.visit_result = 'PAID')::NUMERIC
+          / NULLIF(COUNT(*), 0) * 100, 2
+      )                                                          AS conversion_rate_pct
+  FROM juris_fact_collection_field_visit_activity_today_odps f
+  WHERE f.activity_date BETWEEN $1 AND $2
+  GROUP BY f.activity_date
+  ORDER BY f.activity_date;
+
+---
+# ── Payment tools ─────────────────────────────────────────────────────────────
+
+kind: tool
+name: tool_payment_channel_breakdown
+type: postgres-sql
+source: collection-db
+description: >
+  Payment breakdown by method, channel, and period type (Salary Cycle = day
+  25–5 of month, Normal otherwise). Returns transaction count and total IDR
+  sorted by amount descending.
+parameters:
+  - name: report_start
+    type: string
+    description: "Start date inclusive, format YYYY-MM-DD"
+  - name: report_end
+    type: string
+    description: "End date inclusive, format YYYY-MM-DD"
+statement: |
+  SELECT
+      p.payment_method,
+      p.payment_channel,
+      CASE
+          WHEN EXTRACT(DAY FROM p.payment_date) >= 25
+            OR EXTRACT(DAY FROM p.payment_date) <= 5
+          THEN 'Salary Cycle' ELSE 'Normal'
+      END                      AS period_type,
+      COUNT(*)                 AS transaction_count,
+      SUM(p.payment_amount)    AS total_amount_idr
+  FROM juris_fact_payment_history_odps p
+  WHERE p.payment_date BETWEEN $1 AND $2
+  GROUP BY p.payment_method, p.payment_channel,
+      CASE
+          WHEN EXTRACT(DAY FROM p.payment_date) >= 25
+            OR EXTRACT(DAY FROM p.payment_date) <= 5
+          THEN 'Salary Cycle' ELSE 'Normal'
+      END
+  ORDER BY total_amount_idr DESC;
+
+---
+kind: tool
+name: tool_payment_by_collector
+type: postgres-sql
+source: collection-db
+description: >
+  Field cash collected per collector (CASH_FIELD payments only), ranked by
+  total amount. Shows collector name, branch, transaction count, and total IDR.
+parameters:
+  - name: report_start
+    type: string
+    description: "Start date inclusive, format YYYY-MM-DD"
+  - name: report_end
+    type: string
+    description: "End date inclusive, format YYYY-MM-DD"
+statement: |
+  SELECT
+      u.collector_id,
+      u.collector_name,
+      s.branch_name,
+      COUNT(*)                 AS transaction_count,
+      SUM(p.payment_amount)    AS total_collected_idr
+  FROM juris_fact_payment_history_odps p
+  JOIN juris_dim_user_odps  u ON u.collector_id = p.collector_id
+  JOIN juris_dim_subcg_odps s ON s.subcg_code   = u.subcg_code
+  WHERE p.payment_date BETWEEN $1 AND $2
+    AND p.payment_method = 'CASH_FIELD'
+  GROUP BY u.collector_id, u.collector_name, s.branch_name
+  ORDER BY total_collected_idr DESC;
+
+---
+kind: tool
+name: tool_payment_contract_history
+type: postgres-sql
+source: collection-db
+description: >
+  Full payment timeline for a single contract: all payments ordered by date,
+  showing amount, method, channel, collector, and receipt number.
+  Use when ops teams need to check a specific customer's payment record.
+parameters:
+  - name: contract_no
+    type: string
+    description: "Contract number to look up (e.g. 'FIN-00123')"
+statement: |
+  SELECT
+    payment_date,
+    payment_amount,
+    payment_method,
+    payment_channel,
+    collector_id,
+    receipt_no
+  FROM juris_fact_payment_history_odps
+  WHERE contract_no = $1
+  ORDER BY payment_date ASC;
+
+---
+# ── Ad-hoc tools (for LLM-driven query building) ─────────────────────────────
+
+kind: tool
+name: postgres-execute-sql
+type: postgres-execute-sql
+source: collection-db
+description: >
+  Executes any SELECT statement against collection_db.
+  Use when predefined tools don't cover the question.
+
+---
+kind: tool
+name: tool_list_tables
+type: postgres-list-tables
+source: collection-db
+description: >
+  Lists all tables in collection_db with their column names, data types,
+  and nullable flags. Use this first when building a custom SQL query —
+  it reveals the full schema without needing prior knowledge.
+
+---
+kind: tool
+name: tool_schema_filter_values
+type: postgres-sql
+source: collection-db
+description: >
+  Returns all valid categorical filter values across both fact tables in one
+  call: visit_result, collection_segment, dpd_bucket, payment_method,
+  payment_channel. Use before writing WHERE clauses to avoid invalid literals.
+statement: |
+  SELECT 'visit_result'       AS column_name, visit_result       AS value, COUNT(*) AS occurrences
+  FROM juris_fact_collection_field_visit_activity_today_odps GROUP BY visit_result
+  UNION ALL
+  SELECT 'collection_segment', collection_segment, COUNT(*)
+  FROM juris_fact_collection_field_visit_activity_today_odps GROUP BY collection_segment
+  UNION ALL
+  SELECT 'dpd_bucket',         dpd_bucket,         COUNT(*)
+  FROM juris_fact_collection_field_visit_activity_today_odps GROUP BY dpd_bucket
+  UNION ALL
+  SELECT 'payment_method',     payment_method,     COUNT(*)
+  FROM juris_fact_payment_history_odps GROUP BY payment_method
+  UNION ALL
+  SELECT 'payment_channel',    payment_channel,    COUNT(*)
+  FROM juris_fact_payment_history_odps GROUP BY payment_channel
+  ORDER BY column_name, occurrences DESC;
+
+---
+# ── Toolsets ──────────────────────────────────────────────────────────────────
+
+kind: toolset
+name: collection_report
+tools:
+  - tool_visit_kpis
+  - tool_dpd_aging
+  - tool_branch_performance
+  - tool_ptp_fulfillment
+
+---
+kind: toolset
+name: visit_activity
+tools:
+  - tool_visit_outcome_breakdown
+  - tool_visit_collector_ranking
+  - tool_visit_daily_trend
+
+---
+kind: toolset
+name: payment
+tools:
+  - tool_payment_channel_breakdown
+  - tool_payment_by_collector
+  - tool_payment_contract_history
+
+---
+kind: toolset
+name: adhoc
+tools:
+  - postgres-execute-sql
+  - tool_list_tables
+  - tool_schema_filter_values

@@ -2,7 +2,7 @@
 
 A Google ADK agent that answers collection operations questions by querying
 `collection_db` through **MCP Toolbox**. Built as a hands-on learning project
-for ADK + MCP Toolbox integration.
+for ADK + MCP Toolbox integration — demonstrating three distinct design patterns.
 
 **Domain:** Indonesian multifinance — field visits, DPD aging, PTP fulfillment,
 branch performance, payment analysis.
@@ -43,13 +43,151 @@ without needing an agent or writing code.
 **Key concept:** Test predefined tools directly in the UI before wiring the agent.
 Confirms SQL and parameters work before debugging through the agent layer.
 
-### Milestone 5 — Agent Skills (planned)
-Generate portable `SKILL.md` + scripts from toolsets using:
-```bash
-toolbox tools.yaml skills-generate --name collection-report --toolset collection_report
+### Milestone 5 — ADK SkillToolset + Second Agent (Tool-Based Execution)
+
+Created `collection_report_agent/` — a second ADK agent that uses `SkillToolset` with
+3-level progressive disclosure alongside `ToolboxToolset` for SQL execution.
+
+**How it works:**
+
+```python
+skill_toolset = SkillToolset(
+    skills=[load_skill_from_dir(_SKILLS_DIR / "collection-report"), ...],
+    additional_tools=[toolbox],   # ToolboxToolset nested here, not in agent.tools
+)
+root_agent = Agent(tools=[skill_toolset])  # single entry point
 ```
-Generated skills can be installed into Gemini CLI. For ADK, the SKILL.md serves
-as a portable description layer; execution still goes through `ToolboxToolset`.
+
+Each `SKILL.md` frontmatter declares which execution tools to expose when the skill activates:
+
+```yaml
+metadata:
+  adk_additional_tools:
+    - tool_visit_kpis
+    - tool_dpd_aging
+```
+
+**3-level progressive disclosure:**
+- **L1** (~100 tokens per skill): name + description auto-injected into every LLM turn by `SkillToolset.process_llm_request` — no `list_skills` call needed
+- **L2** (SKILL.md body): loaded on demand via `load_skill` — delivers `## When to Use` + `## Workflow` + tool parameter reference
+- **L3** (assets/references/scripts): not used — all execution goes through `ToolboxToolset`
+
+**Key concept:** `SkillToolset` handles discovery and workflow instructions; `ToolboxToolset`
+handles SQL execution. The `adk_additional_tools` metadata field is the bridge — it scopes
+which execution tools the model can see after a skill is activated, keeping tool selection
+focused to the current domain.
+
+**System prompt becomes thin:** `SkillToolset` auto-injects its own skill system instructions
+(telling the model to call `load_skill` before proceeding). The agent prompt only needs
+identity, mission, and boundary rules — no workflow steps or tool inventory.
+
+| | MCP Toolbox Skills (generated) | ADK SkillToolset (this agent) |
+|---|---|---|
+| Execution | `npx @toolbox-sdk/server` (Node.js) | `ToolboxToolset` via HTTP |
+| Runtime | Gemini CLI | ADK agent runtime |
+| `SKILL.md` role | Metadata + usage docs | L2 instructions injected into LLM context |
+| Scripts | `.js` scripts (not used in ADK) | Not needed — no `scripts/` directory |
+
+---
+
+### Milestone 6 — ADK SkillToolset + Script Execution (Third Agent)
+
+Created `collection_script_agent/` — a third agent demonstrating the **script execution pattern**:
+`SkillToolset(code_executor=UnsafeLocalCodeExecutor())`. Instead of calling `ToolboxToolset` as
+additional tools, the LLM calls `run_skill_script` which executes Python scripts that call the
+MCP Toolbox JSON-RPC endpoint directly.
+
+```python
+skill_toolset = SkillToolset(
+    skills=[load_skill_from_dir(_SKILLS_DIR / "collection-report"), ...],
+    code_executor=UnsafeLocalCodeExecutor(),   # no additional_tools
+)
+```
+
+Each SKILL.md workflow references Python scripts instead of tool names:
+```markdown
+## Workflow
+2. Match the question to a script:
+   - Overall KPIs → `scripts/tool_visit_kpis.py --report_start DATE --report_end DATE`
+```
+
+**Execution path:**
+```
+LLM → run_skill_script("scripts/tool_visit_kpis.py", "--report_start 2025-01-01 --report_end 2025-01-31")
+       ↓ UnsafeLocalCodeExecutor
+       Python script (argparse → urllib → JSON-RPC POST to /mcp)
+       ↓ MCP Toolbox Docker container → PostgreSQL
+```
+
+**Key concept:** `run_skill_script` passes arguments as `sys.argv`, so scripts use `argparse` for
+the human-facing interface and serialize to JSON internally. Scripts run from a temp directory,
+so `pathlib.Path.cwd()` and `__file__`-based path navigation are unreliable — use an env var
+(`WORKSPACE`) for any absolute path lookup.
+
+---
+
+## Three Design Patterns: MCP Toolbox + ADK
+
+This project implements three patterns for connecting ADK agents to MCP Toolbox, each with
+different trade-offs:
+
+| | Pattern 1 — Direct | Pattern 2 — Skills + Tools | Pattern 3 — Skills + Scripts |
+|---|---|---|---|
+| **Agent** | `collection_analysis_agent` | `collection_report_agent` | `collection_script_agent` |
+| **SkillToolset** | Not used | `additional_tools=[toolbox]` | `code_executor=UnsafeLocalCodeExecutor()` |
+| **Execution** | LLM → tool call → HTTP | LLM → `load_skill` → tool call → HTTP | LLM → `run_skill_script` → Python → HTTP |
+| **Skill scoping** | N/A | `adk_additional_tools` in frontmatter | SKILL.md workflow references scripts by name |
+| **Best for** | Full tool access, no workflow overhead | Domain-scoped workflows, structured disclosure | Script-level control, post-processing, platform flexibility |
+
+### MCP Toolbox-Generated Skills: Limitations in ADK
+
+MCP Toolbox generates `.js` scripts in `mcp-toolbox/skills/` for use with **Gemini CLI and Claude
+Code**. These scripts are not directly usable with ADK's `UnsafeLocalCodeExecutor`. Known limitations:
+
+**1. Platform binary dependency**
+`@toolbox-sdk/server@1.0.0` requires a platform-specific binary. ARM64 Linux is unsupported:
+```
+Unsupported platform: linux-arm64
+```
+
+**2. Argument format mismatch**
+The JS scripts expect a single JSON string positional argument:
+```bash
+node script.js '{"report_start": "2025-01-01", "report_end": "2025-01-31"}'  # ✓ correct
+node script.js --report_start 2025-01-01 --report_end 2025-01-31              # ✗ empty output
+```
+`run_skill_script` passes argparse-style flags — the toolbox SDK CLI silently ignores them.
+
+**3. `sys.exit()` swallows error context**
+Calling `sys.exit(returncode)` inside exec'd Python code raises `SystemExit`, which ADK catches
+as an unhandled exception and formats as a traceback — hiding any stderr the script printed before it.
+
+**4. Path resolution breaks in temp directory**
+`UnsafeLocalCodeExecutor` copies scripts to `/tmp/tmpXXXXX/` and sets CWD there.
+Both `pathlib.Path(__file__).resolve().parents[N]` and `pathlib.Path.cwd()` return temp paths,
+not the project workspace.
+
+**The correct pattern for ADK** is to write custom Python scripts that call the running MCP
+Toolbox container via its JSON-RPC 2.0 endpoint directly:
+```python
+# POST http://127.0.0.1:5002/mcp
+{"jsonrpc": "2.0", "method": "tools/call",
+ "params": {"name": "tool_visit_kpis", "arguments": {...}}, "id": 1}
+```
+This reuses the already-running Docker infrastructure and eliminates the Node.js dependency entirely.
+
+| Context | Execution layer | Script type |
+|---|---|---|
+| Gemini CLI / Claude Code | `npx @toolbox-sdk/server` | JS (generated by toolbox) |
+| ADK `SkillToolset` | `UnsafeLocalCodeExecutor` | Python (custom, calling JSON-RPC) |
+
+### Worth Trying: Running JS Scripts in ADK
+
+Two alternatives that could enable the toolbox-generated JS scripts to work inside `SkillToolset` without rewriting them to Python:
+
+- **Custom `CodeExecutor` subclass** — ADK's `BaseCodeExecutor` is extensible. A Node.js executor would invoke `node` via subprocess, translate argparse-style flags back to the JSON string the toolbox SDK expects, and return stdout as the result. The platform binary limitation (`linux-arm64`) still applies unless Node.js is installed separately from the npm package.
+
+- **Alibaba Open Sandbox** — An open-source Docker-based code sandbox ([alibaba/open-sandbox](https://github.com/alibaba/open-sandbox)) that supports multiple runtimes including Node.js. Wrapping it as a custom `CodeExecutor` would give real process isolation, resource limits, and multi-runtime support (Python + Node.js in the same agent) — solving both the isolation concern of `UnsafeLocalCodeExecutor` and the Node.js runtime gap.
 
 ---
 
@@ -195,16 +333,49 @@ Useful built-ins: `postgres-list-tables`, `postgres-list-schemas`,
 
 ```
 adk-sql-agent/
-├── collection_analysis_agent/
-│   ├── agent.py          # root_agent + ToolboxToolset wiring
-│   ├── prompts.py        # 5-pattern system prompt (behavior only)
+├── collection_analysis_agent/      # Pattern 1: ToolboxToolset only
+│   ├── agent.py                    # BuiltInPlanner + ToolboxToolset (all 13 tools)
+│   ├── prompts.py                  # 5-pattern system prompt (behavior only)
 │   ├── __init__.py
-│   └── .env              # GOOGLE_API_KEY + TOOLBOX_URL
+│   └── .env                        # GOOGLE_API_KEY + TOOLBOX_URL
+├── collection_report_agent/        # Pattern 2: SkillToolset + additional_tools
+│   ├── agent.py                    # SkillToolset(additional_tools=[toolbox])
+│   ├── prompts.py                  # minimal 3-section prompt
+│   ├── skills/
+│   │   ├── collection-report/SKILL.md   # adk_additional_tools: 4 tools
+│   │   ├── visit-activity/SKILL.md      # adk_additional_tools: 3 tools
+│   │   ├── payment/SKILL.md             # adk_additional_tools: 3 tools
+│   │   └── adhoc/SKILL.md               # adk_additional_tools: 3 tools
+│   ├── __init__.py
+│   └── .env                        # GOOGLE_API_KEY + TOOLBOX_URL
+├── collection_script_agent/        # Pattern 3: SkillToolset + UnsafeLocalCodeExecutor
+│   ├── agent.py                    # SkillToolset(code_executor=UnsafeLocalCodeExecutor())
+│   ├── prompts.py                  # minimal 3-section prompt
+│   ├── skills/
+│   │   ├── collection-report/
+│   │   │   ├── SKILL.md            # workflow references Python scripts
+│   │   │   └── scripts/            # 4 Python scripts → JSON-RPC → MCP Toolbox
+│   │   ├── visit-activity/
+│   │   │   ├── SKILL.md
+│   │   │   └── scripts/            # 3 Python scripts
+│   │   ├── payment/
+│   │   │   ├── SKILL.md
+│   │   │   └── scripts/            # 3 Python scripts
+│   │   └── adhoc/
+│   │       ├── SKILL.md
+│   │       └── scripts/            # 3 Python scripts
+│   ├── __init__.py
+│   └── .env                        # GOOGLE_API_KEY + TOOLBOX_URL + WORKSPACE
 ├── mcp-toolbox/
-│   ├── tools.yaml        # 1 source, 13 tools, 4 toolsets
+│   ├── tools.yaml                  # 1 source, 13 tools, 4 toolsets
 │   ├── docker-compose.yml
-│   └── .env              # DB credentials
-├── TEST_SCENARIOS.md     # 18 test scenarios
-├── CLAUDE.md             # Claude Code guidance
-└── pyproject.toml        # uv dependencies
+│   ├── skills/                     # Toolbox-generated skills for Gemini CLI / Claude Code
+│   │   ├── collection-report/      # JS scripts + assets/tools.yaml
+│   │   ├── visit-activity/
+│   │   ├── payment/
+│   │   └── adhoc/
+│   └── .env                        # DB credentials
+├── TEST_SCENARIOS.md               # 18 test scenarios
+├── CLAUDE.md                       # Claude Code guidance
+└── pyproject.toml                  # uv dependencies
 ```
