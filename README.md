@@ -325,6 +325,7 @@ Useful built-ins: `postgres-list-tables`, `postgres-list-schemas`,
 | PostgreSQL (collection_db) | 5433 | `sql_agent_postgres` |
 | MCP Toolbox (this project) | 5002 | `adk_toolbox` |
 | MCP Toolbox (reference) | 5001 | `mcp_toolbox` |
+| Redis (memory persistence) | 6379 | `adk_redis` |
 | pgAdmin | 5051 | `sql_agent_pgadmin` |
 
 ---
@@ -333,13 +334,19 @@ Useful built-ins: `postgres-list-tables`, `postgres-list-schemas`,
 
 ```
 adk-sql-agent/
-├── collection_analysis_agent/      # Pattern 1: ToolboxToolset only
-│   ├── agent.py                    # BuiltInPlanner + ToolboxToolset (all 13 tools)
-│   ├── prompts.py                  # 5-pattern system prompt (behavior only)
+├── shared/                         # Shared memory layer (Pattern 1 & 2)
+│   ├── memory_service.py           # RedisMemoryService — 5 memory types + TTLs
+│   ├── memory_tools.py             # 6 ADK tools: remember_*/recall_corrections
+│   └── callbacks.py                # memory_extraction_callback (auto-archive + correction detect)
+├── collection_analysis_agent/      # Pattern 1: ToolboxToolset + memory tools
+│   ├── agent.py                    # App(TaskToDoPlanner + 6 memory tools + EventsCompactionConfig)
+│   ├── prompts.py                  # 6-section system prompt (adds Memory Protocol)
+│   ├── planners/
+│   │   └── task_planner.py         # TaskToDoPlanner(BasePlanner) — <TODO>/<DONE> tags
 │   ├── __init__.py
 │   └── .env                        # GOOGLE_API_KEY + TOOLBOX_URL
-├── collection_skill_agent/         # Pattern 2: SkillToolset + additional_tools
-│   ├── agent.py                    # SkillToolset(additional_tools=[toolbox])
+├── collection_skill_agent/         # Pattern 2: SkillToolset + additional_tools + memory tools
+│   ├── agent.py                    # App(TaskToDoPlanner + 6 memory tools + EventsCompactionConfig)
 │   ├── prompts.py                  # minimal 3-section prompt
 │   ├── skills/
 │   │   ├── collection-report/SKILL.md   # adk_additional_tools: 4 tools
@@ -375,7 +382,52 @@ adk-sql-agent/
 │   │   ├── payment/
 │   │   └── adhoc/
 │   └── .env                        # DB credentials
+├── mcp-toolbox/
+│   ├── tools.yaml                  # 1 source, 13 tools, 4 toolsets
+│   ├── docker-compose.yml          # adk_toolbox (port 5002) + adk_redis (port 6379)
+│   ├── skills/                     # Toolbox-generated skills for Gemini CLI / Claude Code
+│   └── .env                        # DB credentials
+├── services.yaml                   # ADK services: registers RedisMemoryService
 ├── TEST_SCENARIOS.md               # 18 test scenarios
+├── MEMORY_IMPLEMENTATION.md        # Full persistence + memory architecture
+├── QUICK_START_MEMORY.md           # 5-min memory system test
+├── TEST_MEMORY_SCENARIOS.md        # 7 comprehensive memory test scenarios
 ├── CLAUDE.md                       # Claude Code guidance
 └── pyproject.toml                  # uv dependencies
 ```
+
+---
+
+## Memory & Session Persistence
+
+The agent has persistent query correction memory powered by Redis, plus SQLite session storage.
+Users can teach the agent domain-specific patterns once; corrections apply to future queries automatically.
+
+**For memory setup and testing**, see the three guides:
+
+| Guide | Purpose | Read time |
+|-------|---------|-----------|
+| **MEMORY_IMPLEMENTATION.md** | Full architecture, API reference, services setup | 20 min |
+| **QUICK_START_MEMORY.md** | Verify memory works end-to-end in 5 min | 5 min |
+| **TEST_MEMORY_SCENARIOS.md** | 7 realistic test scenarios (corrections, vocabulary, error patterns, etc.) | 15 min |
+
+**Quick start:**
+```bash
+# Start Redis + Toolbox
+cd mcp-toolbox && docker compose up -d && cd ..
+
+# Run agent with memory
+uv run adk web \
+  --session_service_uri="sqlite:///./sessions.db" \
+  --memory_service_uri="redis://localhost:6379" \
+  .
+```
+
+Memory types stored:
+- **Query corrections** (90 days) — wrong → correct patterns learned from user feedback
+- **Preferences** (persistent) — user's format/verbosity choices
+- **Schema cache** (7 days) — table structures, avoiding repeated lookups
+- **Vocabulary** (90 days) — business term definitions
+- **Error patterns** (90 days) — failed SQL patterns to avoid
+
+See **MEMORY_IMPLEMENTATION.md** for the full implementation walkthrough and how to extend memory to Pattern 2 & 3 agents.

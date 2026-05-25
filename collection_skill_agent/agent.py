@@ -42,13 +42,24 @@ import os
 import pathlib
 
 from google.adk.agents.llm_agent import Agent
-from google.adk.planners import BuiltInPlanner
+from google.adk.agents.invocation_context import EventsCompactionConfig
+from google.adk.apps import App
 from google.adk.skills import load_skill_from_dir
 from google.adk.tools.skill_toolset import SkillToolset
 from google.adk.tools.toolbox_toolset import ToolboxToolset
 from google.genai import types as genai_types
 
 from .prompts import SKILL_SYSTEM_PROMPT
+from collection_analysis_agent.planners import TaskToDoPlanner
+from shared.memory_tools import (
+    remember_query_correction,
+    remember_preference,
+    remember_schema_discovery,
+    remember_term,
+    remember_failed_pattern,
+    recall_corrections,
+)
+from shared.callbacks import memory_extraction_callback
 
 _SKILLS_DIR = pathlib.Path(__file__).parent / "skills"
 
@@ -74,18 +85,41 @@ root_agent = Agent(
         "Uses SkillToolset for domain instructions and ToolboxToolset for execution."
     ),
     instruction=SKILL_SYSTEM_PROMPT,
-    tools=[skill_toolset],
-    planner=BuiltInPlanner(
+    tools=[
+        skill_toolset,
+        remember_query_correction,
+        remember_preference,
+        remember_schema_discovery,
+        remember_term,
+        remember_failed_pattern,
+        recall_corrections,
+    ],
+    after_agent_callback=memory_extraction_callback,
+    planner=TaskToDoPlanner(
         thinking_config=genai_types.ThinkingConfig(
-            thinking_level=genai_types.ThinkingLevel.MINIMAL,
-        )
+            include_thoughts=True,
+            thinking_level="low",
+        ),
+        domain_hint="collection operations with skill-guided discovery",
     ),
     generate_content_config=genai_types.GenerateContentConfig(
+        thinking_config=None,  # Set to None when use planner
         http_options=genai_types.HttpOptions(
             retry_options=genai_types.HttpRetryOptions(
                 initial_delay=2,
                 attempts=4
             )
         )
+    ),
+)
+
+app = App(
+    name="collection_skill_agent",
+    root_agent=root_agent,
+    events_compaction_config=EventsCompactionConfig(
+        compaction_interval=10,    # Compact every 10 turns
+        overlap_size=2,            # Keep last 2 turns before compacting
+        token_threshold=4000,      # Trigger at 4k tokens
+        event_retention_size=1000, # Retain up to 1000 events
     ),
 )

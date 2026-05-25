@@ -40,11 +40,22 @@ GoogleADKInstrumentor().instrument(tracer_provider=provider)
 
 import os
 from google.adk.agents.llm_agent import Agent
-from google.adk.planners import BuiltInPlanner
+from google.adk.agents.invocation_context import EventsCompactionConfig
+from google.adk.apps import App
 from google.adk.tools.toolbox_toolset import ToolboxToolset
 from google.genai import types as genai_types
 
 from .prompts import BASE_SYSTEM_PROMPT
+from .planners import TaskToDoPlanner
+from shared.memory_tools import (
+    remember_query_correction,
+    remember_preference,
+    remember_schema_discovery,
+    remember_term,
+    remember_failed_pattern,
+    recall_corrections,
+)
+from shared.callbacks import memory_extraction_callback
 
 toolbox = ToolboxToolset(
     server_url=os.getenv("TOOLBOX_URL", "http://127.0.0.1:5002"),
@@ -55,18 +66,41 @@ root_agent = Agent(
     name='collection_analysis_agent',
     description='Collection operations analyst. Analyzes field visits, payments, DPD aging, PTP fulfillment, and branch performance from collection_db using SQL queries. Provides insights for collection teams.',
     instruction=BASE_SYSTEM_PROMPT,
-    tools=[toolbox],
-    planner=BuiltInPlanner(
+    tools=[
+        toolbox,
+        remember_query_correction,
+        remember_preference,
+        remember_schema_discovery,
+        remember_term,
+        remember_failed_pattern,
+        recall_corrections,
+    ],
+    after_agent_callback=memory_extraction_callback,
+    planner=TaskToDoPlanner(
         thinking_config=genai_types.ThinkingConfig(
-            thinking_level=genai_types.ThinkingLevel.LOW,
-        )
+            include_thoughts=True,
+            thinking_level="low",
+        ),
+        domain_hint="collection SQL analysis (DPD, PTP, field visits, payments)",
     ),
     generate_content_config=genai_types.GenerateContentConfig(
+        thinking_config=None,  # Set to None when use planner
         http_options=genai_types.HttpOptions(
             retry_options=genai_types.HttpRetryOptions(
                 initial_delay=2,
                 attempts=4
             )
         )
+    ),
+)
+
+app = App(
+    name="collection_analysis_agent",
+    root_agent=root_agent,
+    events_compaction_config=EventsCompactionConfig(
+        compaction_interval=10,    # Compact every 10 turns
+        overlap_size=2,            # Keep last 2 turns before compacting
+        token_threshold=4000,      # Trigger at 4k tokens
+        event_retention_size=1000, # Retain up to 1000 events
     ),
 )

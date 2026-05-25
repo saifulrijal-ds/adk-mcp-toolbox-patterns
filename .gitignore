@@ -16,6 +16,7 @@ wheels/
 # ADK artifacts and session data
 .adk/
 **/.adk/
+sessions.db
 
 # IDE
 .vscode/

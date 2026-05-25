@@ -11,3 +11,21 @@ services:
     # --ui enables the Toolbox UI at http://localhost:5002/ui
     command: ["--config", "/app/tools.yaml", "--port", "5002", "--ui"]
     restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    container_name: adk_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis_data:

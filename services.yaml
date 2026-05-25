@@ -1,0 +1,4 @@
+services:
+  - scheme: redis
+    type: memory
+    class: shared.memory_service.RedisMemoryService
